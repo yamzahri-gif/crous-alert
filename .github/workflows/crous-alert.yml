@@ -1,0 +1,43 @@
+name: Alerte logement CROUS
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      - name: Lancer le script d'alerte
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python crous_alert.py
+
+      - name: Commit du nouvel état (seen.json)
+        run: |
+          git config user.name "crous-alert-bot"
+          git config user.email "actions@github.com"
+          git add seen.json
+          git diff --staged --quiet || git commit -m "Update seen.json [skip ci]"
+          git push
+Descends en bas, clique sur Commit changes
+
+Une fois ça fait, va dans Settings → Secrets and variables → Actions pour ajouter tes 5 secrets (GMAIL_USER, GMAIL_APP_PASSWORD, ALERT_EMAIL_TO, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) si ce n'est pas déjà fait, puis retourne dans Actions pour lancer le workflow manuellement.
+
+
