@@ -36,7 +36,6 @@ jobs:
           git add seen.json
           git diff --staged --quiet || git commit -m "Update seen.json [skip ci]"
           git push
-Descends en bas, clique sur Commit changes
 
 Une fois ça fait, va dans Settings → Secrets and variables → Actions pour ajouter tes 5 secrets (GMAIL_USER, GMAIL_APP_PASSWORD, ALERT_EMAIL_TO, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) si ce n'est pas déjà fait, puis retourne dans Actions pour lancer le workflow manuellement.
 
