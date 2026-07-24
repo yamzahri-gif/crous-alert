@@ -31,6 +31,7 @@ SEARCH_PATHS = ["/tools/42/search", "/tools/47/search"]
 # à la casse et aux accents sur l'adresse affichée par le CROUS.
 VILLES_CIBLES = [
     "toulouse",
+    "rangueil",
     "blagnac",
     "colomiers",
     "balma",
@@ -43,26 +44,21 @@ VILLES_CIBLES = [
     "saint-orens",
     "castanet",
     "muret",
-    "rangueil",
-    "Toulouse",
-    "Blagnac",
-    "Colomiers",
-    "Balma",
-    "Tournefeuille",
-    "Cugnaux",
-    "Ramonville",
-    "Castanet",
-    "Muret",
-    "Rangueil",
-    
 ]
 
 STATE_FILE = Path(__file__).parent / "seen.json"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://trouverunlogement.lescrous.fr/",
+    "Connection": "keep-alive",
 }
+
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 # --- Notification -----------------------------------------------------
 
@@ -138,13 +134,21 @@ def notify_new_logement(logement: dict) -> None:
 def fetch_page(path: str, page: int) -> BeautifulSoup:
     url = f"{BASE_URL}{path}"
     params = {"page": page} if page > 1 else {}
-    resp = requests.get(url, headers=HEADERS, params=params, timeout=20)
+    # Visite la page d'accueil une première fois pour obtenir les cookies de
+    # session (certains sites bloquent les requêtes "à froid" sans cookies).
+    if not SESSION.cookies:
+        SESSION.get(BASE_URL, timeout=20)
+
+    resp = SESSION.get(url, params=params, timeout=20)
+    print(f"[http] GET {resp.url} -> statut {resp.status_code}, {len(resp.text)} octets reçus.")
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "html.parser")
 
 
 def get_total_pages(soup: BeautifulSoup) -> int:
-    """Cherche le lien 'Dernière page' pour connaître le nombre total de pages."""
+    """Fallback approximatif : cherche un lien 'Dernière page' si présent.
+    Non utilisé comme source de vérité (voir scrape_all qui boucle jusqu'à
+    une page vide), mais gardé pour du logging informatif."""
     last_link = soup.find("a", string=re.compile("Dernière page", re.I))
     if last_link and last_link.get("href"):
         m = re.search(r"page=(\d+)", last_link["href"])
@@ -214,25 +218,30 @@ def is_target_city(adresse: str) -> bool:
 
 def scrape_all() -> list[dict]:
     all_logements = []
+    MAX_PAGES = 25  # garde-fou pour éviter une boucle infinie
+
     for path in SEARCH_PATHS:
-        try:
-            first_page = fetch_page(path, 1)
-        except requests.RequestException as e:
-            print(f"[scrape] échec sur {path}: {e}")
-            continue
-
-        total_pages = get_total_pages(first_page)
-        print(f"[scrape] {path}: {total_pages} page(s) au total.")
-
-        all_logements.extend(parse_listings(first_page))
-        for page in range(2, total_pages + 1):
+        page = 1
+        path_count = 0
+        while page <= MAX_PAGES:
             try:
                 soup = fetch_page(path, page)
             except requests.RequestException as e:
                 print(f"[scrape] échec page {page} de {path}: {e}")
-                continue
-            all_logements.extend(parse_listings(soup))
+                break
 
+            listings = parse_listings(soup)
+            if not listings:
+                # Page vide = on a dépassé la dernière page réelle.
+                break
+
+            all_logements.extend(listings)
+            path_count += len(listings)
+            page += 1
+
+        print(f"[scrape] {path}: {path_count} logement(s) sur {page - 1} page(s).")
+
+    print(f"[diagnostic] {len(all_logements)} logement(s) au total (toutes villes confondues, avant filtrage).")
     return [l for l in all_logements if is_target_city(l["adresse"])]
 
 
