@@ -43,6 +43,18 @@ VILLES_CIBLES = [
     "saint-orens",
     "castanet",
     "muret",
+    "rangueil",
+    "Toulouse",
+    "Blagnac",
+    "Colomiers",
+    "Balma",
+    "Tournefeuille",
+    "Cugnaux",
+    "Ramonville",
+    "Castanet",
+    "Muret",
+    "Rangueil",
+    
 ]
 
 STATE_FILE = Path(__file__).parent / "seen.json"
