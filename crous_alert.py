@@ -172,8 +172,11 @@ def parse_listings(soup: BeautifulSoup) -> list[dict]:
         if url.startswith("/"):
             url = BASE_URL + url
 
-        # Le conteneur parent contient l'adresse, prix, surface, type
-        container = h3.find_parent(["li", "div", "article"]) or h3.parent
+        # Le conteneur doit englober TOUTE la carte (image, prix, titre,
+        # adresse, surface...). On priorise le <li> englobant, car un <div>
+        # ancestor peut être un simple wrapper interne du titre qui n'inclut
+        # pas le prix (affiché ailleurs dans la carte).
+        container = h3.find_parent("li") or h3.find_parent(["div", "article"]) or h3.parent
         text_block = container.get_text("\n", strip=True) if container else ""
         lines = [l for l in text_block.split("\n") if l.strip()]
 
@@ -275,9 +278,11 @@ def main():
             print(f"  -> {logement['titre']} ({logement['adresse']})")
             notify_new_logement(logement)
 
-    # Met à jour l'état avec tout ce qui est actuellement en ligne
+    # Remplace l'état par ce qui est actuellement en ligne (et non une
+    # fusion cumulative). Un logement qui disparaît puis réapparaît plus
+    # tard (annulation, désistement...) doit redéclencher une alerte.
     current_ids = {l["id"] for l in logements}
-    save_seen(seen | current_ids)
+    save_seen(current_ids)
 
 
 if __name__ == "__main__":
