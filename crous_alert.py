@@ -9,6 +9,7 @@ alerte (email + Telegram) pour chaque NOUVEAU logement détecté.
 Licence des données : Etalab-2.0 (site gouvernemental, réutilisation libre).
 """
 
+import hashlib
 import json
 import os
 import re
@@ -26,6 +27,17 @@ BASE_URL = "https://trouverunlogement.lescrous.fr"
 # tools/42 = campagne en cours (phase complémentaire 2025-2026).
 # tools/47 = campagne 2026-2027, à activer quand elle ouvrira.
 SEARCH_PATHS = ["/tools/42/search", "/tools/47/search"]
+
+# Recherche filtrée par le site lui-même (bounds générés par sa propre
+# géolocalisation en tapant "Toulouse"). Sert de SECONDE source en plus du
+# scan complet ci-dessus : le site semble parfois incohérent entre sa liste
+# "toute la France" et sa recherche filtrée par ville, donc on combine les
+# deux pour réduire le risque de rater un logement.
+TOULOUSE_BOUNDS = "1.3503956_43.668708_1.5153795_43.532654"
+EXTRA_SEARCH_URLS = [
+    f"{BASE_URL}/tools/42/search?bounds={TOULOUSE_BOUNDS}&locationName=Toulouse",
+    f"{BASE_URL}/tools/47/search?bounds={TOULOUSE_BOUNDS}&locationName=Toulouse",
+]
 
 # Communes à surveiller (Toulouse + agglomération). Comparaison insensible
 # à la casse et aux accents sur l'adresse affichée par le CROUS.
@@ -107,8 +119,11 @@ def send_telegram(text: str) -> None:
         print("[telegram] envoyé.")
 
 
-def notify_new_logement(logement: dict) -> None:
-    subject = f"🏠 Nouveau logement CROUS : {logement['titre']} ({logement['ville']})"
+def notify_logement(logement: dict, reason: str) -> None:
+    """reason: 'nouveau' (jamais vu) ou 'modifié' (déjà vu, caractéristiques
+    changées : prix, surface, type, équipements...)."""
+    label = "Nouveau logement CROUS" if reason == "nouveau" else "Logement CROUS mis à jour"
+    subject = f"🏠 {label} : {logement['titre']} ({logement['ville']})"
     body = (
         f"{logement['titre']}\n"
         f"{logement['adresse']}\n"
@@ -120,7 +135,7 @@ def notify_new_logement(logement: dict) -> None:
     send_email(subject, body)
 
     tg_text = (
-        f"🏠 <b>Nouveau logement CROUS</b>\n"
+        f"🏠 <b>{label}</b>\n"
         f"<b>{logement['titre']}</b> — {logement['ville']}\n"
         f"{logement['adresse']}\n"
         f"💶 {logement['prix']} | 📐 {logement['surface']} | {logement['type']}\n"
@@ -131,13 +146,19 @@ def notify_new_logement(logement: dict) -> None:
 
 # --- Scraping ----------------------------------------------------------
 
-def fetch_page(path: str, page: int) -> BeautifulSoup:
-    url = f"{BASE_URL}{path}"
-    params = {"page": page} if page > 1 else {}
+def fetch_page(path_or_url: str, page: int) -> BeautifulSoup:
     # Visite la page d'accueil une première fois pour obtenir les cookies de
     # session (certains sites bloquent les requêtes "à froid" sans cookies).
     if not SESSION.cookies:
         SESSION.get(BASE_URL, timeout=20)
+
+    if path_or_url.startswith("http"):
+        # URL complète déjà paramétrée (ex. avec bounds/locationName).
+        url = path_or_url
+        params = {"page": page} if page > 1 else {}
+    else:
+        url = f"{BASE_URL}{path_or_url}"
+        params = {"page": page} if page > 1 else {}
 
     resp = SESSION.get(url, params=params, timeout=20)
     print(f"[http] GET {resp.url} -> statut {resp.status_code}, {len(resp.text)} octets reçus.")
@@ -198,6 +219,12 @@ def parse_listings(soup: BeautifulSoup) -> list[dict]:
         m_id = re.search(r"/accommodations/(\d+)", url)
         logement_id = m_id.group(1) if m_id else url
 
+        # Empreinte du contenu complet de la carte (prix, surface, type,
+        # équipements...) : permet de détecter un changement de
+        # caractéristiques sur un logement déjà connu (même ID), et pas
+        # seulement l'apparition d'un nouvel ID.
+        signature = hashlib.md5(text_block.encode("utf-8")).hexdigest()
+
         results.append(
             {
                 "id": logement_id,
@@ -208,6 +235,7 @@ def parse_listings(soup: BeautifulSoup) -> list[dict]:
                 "surface": surface,
                 "type": type_log,
                 "url": url,
+                "signature": signature,
             }
         )
 
@@ -244,20 +272,48 @@ def scrape_all() -> list[dict]:
 
         print(f"[scrape] {path}: {path_count} logement(s) sur {page - 1} page(s).")
 
+    # Seconde passe : recherche filtrée par le site lui-même sur "Toulouse"
+    # (bounds réels générés par leur géolocalisation). Sert de filet de
+    # sécurité en plus du scan complet ci-dessus, au cas où les deux listes
+    # ne soient pas parfaitement synchronisées côté serveur du CROUS.
+    for url in EXTRA_SEARCH_URLS:
+        try:
+            soup = fetch_page(url, 1)
+        except requests.RequestException as e:
+            print(f"[scrape] échec recherche filtrée {url}: {e}")
+            continue
+        listings = parse_listings(soup)
+        print(f"[scrape] recherche filtrée Toulouse ({url}): {len(listings)} logement(s).")
+        all_logements.extend(listings)
+
+    # Dédoublonnage par ID (un même logement peut apparaître dans le scan
+    # complet ET dans la recherche filtrée).
+    dedup = {l["id"]: l for l in all_logements}
+    all_logements = list(dedup.values())
+
     print(f"[diagnostic] {len(all_logements)} logement(s) au total (toutes villes confondues, avant filtrage).")
     return [l for l in all_logements if is_target_city(l["adresse"])]
 
 
 # --- État / persistance -------------------------------------------------
 
-def load_seen() -> set:
-    if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text()))
-    return set()
+def load_seen() -> dict:
+    """Retourne un dict {id: signature}. Migre automatiquement l'ancien
+    format (simple liste d'IDs) en attribuant une signature vide, ce qui
+    déclenchera une notification 'mis à jour' une seule fois lors de la
+    migration (sans casser le script)."""
+    if not STATE_FILE.exists():
+        return {}
+    data = json.loads(STATE_FILE.read_text())
+    if isinstance(data, list):
+        return {logement_id: "" for logement_id in data}
+    return data
 
 
-def save_seen(seen: set) -> None:
-    STATE_FILE.write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2))
+def save_seen(seen: dict) -> None:
+    STATE_FILE.write_text(
+        json.dumps(seen, ensure_ascii=False, indent=2, sort_keys=True)
+    )
 
 
 # --- Main ----------------------------------------------------------------
@@ -267,22 +323,36 @@ def main():
     logements = scrape_all()
     print(f"{len(logements)} logement(s) trouvé(s) dans la zone ciblée.")
 
-    seen = load_seen()
-    nouveaux = [l for l in logements if l["id"] not in seen]
+    seen = load_seen()  # {id: signature}
 
-    if not nouveaux:
-        print("Aucun nouveau logement depuis la dernière vérification.")
+    nouveaux = []
+    modifies = []
+    for l in logements:
+        ancienne_signature = seen.get(l["id"])
+        if ancienne_signature is None:
+            nouveaux.append(l)
+        elif ancienne_signature != l["signature"]:
+            modifies.append(l)
+
+    if not nouveaux and not modifies:
+        print("Aucun changement depuis la dernière vérification.")
     else:
-        print(f"{len(nouveaux)} nouveau(x) logement(s) ! Envoi des alertes...")
-        for logement in nouveaux:
-            print(f"  -> {logement['titre']} ({logement['adresse']})")
-            notify_new_logement(logement)
+        if nouveaux:
+            print(f"{len(nouveaux)} nouveau(x) logement(s) ! Envoi des alertes...")
+            for logement in nouveaux:
+                print(f"  -> {logement['titre']} ({logement['adresse']})")
+                notify_logement(logement, reason="nouveau")
+        if modifies:
+            print(f"{len(modifies)} logement(s) modifié(s) ! Envoi des alertes...")
+            for logement in modifies:
+                print(f"  -> {logement['titre']} ({logement['adresse']})")
+                notify_logement(logement, reason="modifié")
 
     # Remplace l'état par ce qui est actuellement en ligne (et non une
     # fusion cumulative). Un logement qui disparaît puis réapparaît plus
     # tard (annulation, désistement...) doit redéclencher une alerte.
-    current_ids = {l["id"] for l in logements}
-    save_seen(current_ids)
+    nouvel_etat = {l["id"]: l["signature"] for l in logements}
+    save_seen(nouvel_etat)
 
 
 if __name__ == "__main__":
